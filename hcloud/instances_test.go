@@ -374,6 +374,97 @@ func TestInstances_InstanceMetadata(t *testing.T) {
 	}
 }
 
+func TestInstances_InstanceMetadataHCloudInternalIPPreservation(t *testing.T) {
+	tests := []struct {
+		name          string
+		addressFamily config.AddressFamily
+		networkID     int64
+		privateNet    []schema.ServerPrivateNet
+		nodeAddresses []corev1.NodeAddress
+		expected      []corev1.NodeAddress
+	}{
+		{
+			name:          "preserves existing InternalIP when no hcloud InternalIP exists",
+			addressFamily: config.AddressFamilyIPv4,
+			networkID:     0,
+			nodeAddresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "100.64.0.1"}},
+			expected: []corev1.NodeAddress{
+				{Type: corev1.NodeHostName, Address: "foobar"},
+				{Type: corev1.NodeExternalIP, Address: "203.0.113.7"},
+				{Type: corev1.NodeInternalIP, Address: "100.64.0.1"},
+			},
+		},
+		{
+			name:          "does not preserve existing InternalIP when hcloud network provides one",
+			addressFamily: config.AddressFamilyIPv4,
+			networkID:     1,
+			privateNet:    []schema.ServerPrivateNet{{Network: 1, IP: "10.0.0.2"}},
+			nodeAddresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "100.64.0.1"}},
+			expected: []corev1.NodeAddress{
+				{Type: corev1.NodeHostName, Address: "foobar"},
+				{Type: corev1.NodeExternalIP, Address: "203.0.113.7"},
+				{Type: corev1.NodeInternalIP, Address: "10.0.0.2"},
+			},
+		},
+		{
+			name:          "does not preserve existing InternalIP when it duplicates ExternalIP",
+			addressFamily: config.AddressFamilyIPv4,
+			networkID:     0,
+			nodeAddresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "203.0.113.7"}},
+			expected: []corev1.NodeAddress{
+				{Type: corev1.NodeHostName, Address: "foobar"},
+				{Type: corev1.NodeExternalIP, Address: "203.0.113.7"},
+			},
+		},
+		{
+			name:          "does not preserve existing InternalIP when address family mismatches",
+			addressFamily: config.AddressFamilyIPv4,
+			networkID:     0,
+			nodeAddresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "2001:db8:1234::"}},
+			expected: []corev1.NodeAddress{
+				{Type: corev1.NodeHostName, Address: "foobar"},
+				{Type: corev1.NodeExternalIP, Address: "203.0.113.7"},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newTestEnv()
+			defer env.Teardown()
+			env.Cfg.Instance.AddressFamily = test.addressFamily
+
+			env.Mux.HandleFunc("/servers/1", func(w http.ResponseWriter, _ *http.Request) {
+				json.NewEncoder(w).Encode(schema.ServerGetResponse{
+					Server: schema.Server{
+						ID:         1,
+						Name:       "foobar",
+						ServerType: schema.ServerType{Name: "asdf11"},
+						Location:   schema.Location{Name: "fsn1"},
+						PublicNet: schema.ServerPublicNet{
+							IPv6: schema.ServerPublicNetIPv6{IP: "2001:db8:1234::/64"},
+							IPv4: schema.ServerPublicNetIPv4{IP: "203.0.113.7"},
+						},
+						PrivateNet: test.privateNet,
+					},
+				})
+			})
+
+			instances := newInstances(env.Client, env.RobotClient, env.Recorder, test.networkID, env.Cfg)
+
+			metadata, err := instances.InstanceMetadata(context.TODO(), &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "foobar"},
+				Spec:       corev1.NodeSpec{ProviderID: "hcloud://1"},
+				Status:     corev1.NodeStatus{Addresses: test.nodeAddresses},
+			})
+			if !assert.NoError(t, err) {
+				return
+			}
+			assert.Equal(t, test.expected, metadata.NodeAddresses)
+		})
+	}
+}
+
 func TestInstances_InstanceMetadataRobotServer(t *testing.T) {
 	env := newTestEnv()
 	defer env.Teardown()

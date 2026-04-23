@@ -95,7 +95,7 @@ func (i *instances) lookupServer(
 				return nil, nil
 			}
 
-			return hcloudServer{server}, nil
+			return hcloudServer{server, i.recorder}, nil
 		}
 
 		if i.robotClient == nil {
@@ -141,7 +141,7 @@ func (i *instances) lookupServer(
 
 	switch {
 	case cloudServer != nil:
-		return hcloudServer{cloudServer}, nil
+		return hcloudServer{cloudServer, i.recorder}, nil
 	case hrobotServer != nil:
 		return robotServer{hrobotServer, i.robotClient, i.recorder}, nil
 	default:
@@ -256,6 +256,80 @@ func hcloudNodeAddresses(
 	return addresses
 }
 
+func appendNodeInternalIPs(
+	node *corev1.Node,
+	addresses []corev1.NodeAddress,
+	cfg config.HCCMConfiguration,
+	recorder record.EventRecorder,
+) []corev1.NodeAddress {
+	if node == nil {
+		return addresses
+	}
+
+	dualStack := cfg.Instance.AddressFamily == config.AddressFamilyDualStack
+	ipv4 := cfg.Instance.AddressFamily == config.AddressFamilyIPv4 || dualStack
+	ipv6 := cfg.Instance.AddressFamily == config.AddressFamilyIPv6 || dualStack
+
+OUTER:
+	for _, currentAddress := range node.Status.Addresses {
+		if currentAddress.Type != corev1.NodeInternalIP {
+			continue
+		}
+
+		ip := net.ParseIP(currentAddress.Address)
+		isIPv4 := ip.To4() != nil
+
+		var warnMsg string
+		if isIPv4 && ipv6 && !dualStack {
+			warnMsg = fmt.Sprintf(
+				"Configured InternalIP is IPv4 even though IPv6 only is configured. As a result, %s is not added as an InternalIP",
+				currentAddress.Address,
+			)
+		} else if !isIPv4 && ipv4 && !dualStack {
+			warnMsg = fmt.Sprintf(
+				"Configured InternalIP is IPv6 even though IPv4 only is configured. As a result, %s is not added as an InternalIP",
+				currentAddress.Address,
+			)
+		}
+
+		if warnMsg != "" {
+			if recorder != nil {
+				recorder.Event(node, corev1.EventTypeWarning, MisconfiguredInternalIP, warnMsg)
+			}
+			klog.Warning(warnMsg)
+			continue
+		}
+
+		for _, address := range addresses {
+			if currentAddress.Address == address.Address {
+				warnMsg := fmt.Sprintf(
+					"Configured InternalIP already exists as an ExternalIP. As a result, %s is not added as an InternalIP",
+					currentAddress.Address,
+				)
+				if recorder != nil {
+					recorder.Event(node, corev1.EventTypeWarning, MisconfiguredInternalIP, warnMsg)
+				}
+				klog.Warning(warnMsg)
+				continue OUTER
+			}
+		}
+
+		addresses = append(addresses, currentAddress)
+	}
+
+	return addresses
+}
+
+func hasNodeAddressType(addresses []corev1.NodeAddress, addressType corev1.NodeAddressType) bool {
+	for _, address := range addresses {
+		if address.Type == addressType {
+			return true
+		}
+	}
+
+	return false
+}
+
 func robotNodeAddresses(
 	server *hrobotmodels.Server,
 	node *corev1.Node,
@@ -280,48 +354,7 @@ func robotNodeAddresses(
 	}
 
 	if cfg.Robot.ForwardInternalIPs {
-	OUTER:
-		for _, currentAddress := range node.Status.Addresses {
-			if currentAddress.Type != corev1.NodeInternalIP {
-				continue
-			}
-
-			ip := net.ParseIP(currentAddress.Address)
-			isIPv4 := ip.To4() != nil
-
-			var warnMsg string
-			if isIPv4 && ipv6 && !dualStack {
-				warnMsg = fmt.Sprintf(
-					"Configured InternalIP is IPv4 even though IPv6 only is configured. As a result, %s is not added as an InternalIP",
-					currentAddress.Address,
-				)
-			} else if !isIPv4 && ipv4 && !dualStack {
-				warnMsg = fmt.Sprintf(
-					"Configured InternalIP is IPv6 even though IPv4 only is configured. As a result, %s is not added as an InternalIP",
-					currentAddress.Address,
-				)
-			}
-
-			if warnMsg != "" {
-				recorder.Event(node, corev1.EventTypeWarning, MisconfiguredInternalIP, warnMsg)
-				klog.Warning(warnMsg)
-				continue
-			}
-
-			for _, address := range addresses {
-				if currentAddress.Address == address.Address {
-					warnMsg := fmt.Sprintf(
-						"Configured InternalIP already exists as an ExternalIP. As a result, %s is not added as an InternalIP",
-						currentAddress.Address,
-					)
-					recorder.Event(node, corev1.EventTypeWarning, MisconfiguredInternalIP, warnMsg)
-					klog.Warning(warnMsg)
-					continue OUTER
-				}
-			}
-
-			addresses = append(addresses, currentAddress)
-		}
+		addresses = appendNodeInternalIPs(node, addresses, cfg, recorder)
 	}
 
 	return addresses
@@ -338,17 +371,23 @@ type genericServer interface {
 
 type hcloudServer struct {
 	*hcloud.Server
+	recorder record.EventRecorder
 }
 
 func (s hcloudServer) IsShutdown() (bool, error) {
 	return s.Status == hcloud.ServerStatusOff, nil
 }
 
-func (s hcloudServer) Metadata(networkID int64, _ *corev1.Node, cfg config.HCCMConfiguration) (*cloudprovider.InstanceMetadata, error) {
+func (s hcloudServer) Metadata(networkID int64, node *corev1.Node, cfg config.HCCMConfiguration) (*cloudprovider.InstanceMetadata, error) {
+	nodeAddresses := hcloudNodeAddresses(networkID, s.Server, cfg)
+	if !hasNodeAddressType(nodeAddresses, corev1.NodeInternalIP) {
+		nodeAddresses = appendNodeInternalIPs(node, nodeAddresses, cfg, s.recorder)
+	}
+
 	return &cloudprovider.InstanceMetadata{
 		ProviderID:    providerid.FromCloudServerID(s.ID),
 		InstanceType:  s.ServerType.Name,
-		NodeAddresses: hcloudNodeAddresses(networkID, s.Server, cfg),
+		NodeAddresses: nodeAddresses,
 		Zone:          legacydatacenter.NameFromLocation(s.Location.Name),
 		Region:        s.Location.Name,
 		AdditionalLabels: map[string]string{
